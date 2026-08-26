@@ -1,0 +1,29 @@
+pkgname=linux-zen-test
+version=7.1.2
+revision=1
+short_desc="Zen kernel with DMEM/VRAM cgroup controller (TEST build) for Void Linux"
+maintainer="your name <you@example.com>"
+license="GPL-2.0-only"
+homepage="https://github.com/rockman6554/kernel-zen-void"
+
+# This is a PREBUILT package. The tarball is produced by
+# .github/workflows/zen-test.yml and uploaded to the "zen-test" release of THIS
+# repo. Before building with xbps-src:
+#   1. Replace OWNER below with your GitHub username (the repo that runs the workflow).
+#   2. Run the workflow once, then copy the SHA256 printed in the release / build log
+#      into the checksum field below.
+# The kernel is built with LOCALVERSION="-zentest" and package name linux-zen-test,
+# so it installs to a separate /boot and /usr/lib/modules entry and CANNOT overwrite
+# your main kernel. This is a TEST build on purpose.
+distfiles="https://github.com/rockman6554/kernel-zen-void/releases/download/zen-test/linux-zen-test-${version}.tar.gz"
+checksum="0000000000000000000000000000000000000000000000000000000000000000"
+
+create_wrksrc=yes
+
+do_install() {
+	vmkdir boot
+	vmkdir usr/lib/modules
+
+	cp -a boot/* ${DESTDIR}/boot/
+	cp -a lib/modules/* ${DESTDIR}/usr/lib/modules/
+}

@@ -1,10 +1,23 @@
-name: Compilar Zen Kernel para Void Linux
+name: Compilar Zen Kernel TEST (DMEM/VRAM cgroup) para Void Linux
 
 on:
   workflow_dispatch:
+  # Rebuild automatically when the test workflow or the zen patch changes,
+  # so pushing this commit executes the rebuild on the fork.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/zen-test.yml'
+      - 'linux-v7.1.2-zen3.patch'
+
+# Separate from the main build: this produces the linux-zen-test package.
+# Kernel LOCALVERSION is set to "-zentest" and the artifact is uploaded to the
+# "zen-test" release tag, so it can never collide with/overwrite the main kernel.
+env:
+  KERNEL_VER: "7.1.2"
 
 jobs:
-  build-kernel:
+  build-kernel-test:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/void-linux/void-glibc-full:latest
@@ -16,39 +29,43 @@ jobs:
           xbps-install -Syu --repository=https://repo-de.voidlinux.org/current/ xbps -y
           xbps-install -Syu --repository=https://repo-de.voidlinux.org/current/ base-devel git bc kmod elfutils-devel bash cpio xz lz4 zstd flex bison openssl-devel curl pahole tar python3 patch wget rsync -y
 
-      - name: 2. Checkout de TU repositorio (para scripts personalizados si los hay)
+      - name: 2. Checkout de TU repositorio (contiene este workflow y el zen patch)
         uses: actions/checkout@v4
         with:
           path: repo
 
-      - name: 3. Clonar fuentes del Zen Kernel 
+      - name: 3. Clonar fuentes del Zen Kernel (v${KERNEL_VER})
         run: |
-          git clone --depth 1 --branch v7.1.2 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-src
+          git clone --depth 1 --branch v${KERNEL_VER} https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux-src
 
-      - name: 4. Obtener configuración base de Void 
+      - name: 4. Obtener configuración base de Void + aplicar parches (zen + fixdep)
         run: |
           cd linux-src
           wget -O fixdep-largefile.patch https://github.com/void-linux/void-packages/raw/refs/heads/master/srcpkgs/linux7.1/patches/fixdep-largefile.patch
           patch -p1 -N --batch < fixdep-largefile.patch
-          wget -O parche.patch https://github.com/javiercplus/kernel-neko-void/raw/refs/heads/main/linux-v7.1.2-zen3.patch
-          patch -p1 -N --batch < parche.patch 
-          wget -O .config https://github.com/void-linux/void-packages/raw/refs/heads/master/srcpkgs/linux7.0/files/x86_64-dotconfig
-          #git config --global user.email "javierc@noreply.com"
-          #git config --global user.name "JavierC"
-          #git am *.patch
+          # Usar el zen patch que viene en ESTE repo (autocontenido en el fork)
+          patch -p1 -N --batch < ../repo/linux-v${KERNEL_VER}-zen3.patch
+          wget -O .config https://github.com/void-linux/void-packages/raw/refs/heads/master/srcpkgs/linux7.1/files/x86_64-dotconfig
           cd ..
 
-      - name: 5. Ajustar configuración (nombre, optimizaciones, debug)
+      - name: 5. Ajustar configuración (nombre, optimizaciones, debug, VRAM/DMEM)
         run: |
           cd linux-src
-          # Evitar sufijo -dirty (por si acaso)
+          # Evitar sufijo -dirty
           scripts/config --disable CONFIG_LOCALVERSION_AUTO
-          scripts/config --set-str CONFIG_LOCALVERSION "-neko"
-          
+          # Identificador de TEST: separa este kernel del principal
+          scripts/config --set-str CONFIG_LOCALVERSION "-zentest"
+
           # Optimizaciones
           scripts/config --enable CONFIG_CC_OPTIMIZE_FOR_SIZE
           scripts/config --enable CONFIG_MODULE_COMPRESS_ZSTD
-          
+
+          # VRAM fix: habilitar el controlador de cgroup DMEM (ya en mainline 7.1.2).
+          # Esto expone dmem.capacity / dmem.low / dmem.max / dmem.current en cgroup v2.
+          # NOTA: el controlador esta en mainline, pero AMDGPU aun no registra su
+          # region de VRAM, asi que los limites son no-op en AMD hasta ese parche.
+          scripts/config --enable CONFIG_CGROUP_DMEM
+
           # Desactivar debug masivo
           scripts/config --disable CONFIG_DEBUG_INFO \
                          --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
@@ -59,28 +76,22 @@ jobs:
                          --disable CONFIG_PROVE_LOCKING \
                          --disable CONFIG_LOCK_STAT \
                          --disable CONFIG_LATENCYTOP
-          
+
           # Desactivar firma de módulos
           scripts/config --disable CONFIG_MODULE_SIG
           scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 
-          # VRAM fix: habilitar el controlador de cgroup DMEM (ya en mainline 7.1.2).
-          # Expone dmem.capacity / dmem.low / dmem.max para GPUs que registran su
-          # region (xe/amdgpu). En i915 no hay registro, asi que es no-op alli.
-          scripts/config --enable CONFIG_CGROUP_DMEM
-
-          # Actualizar configuración (incorpora nuevas opciones)
           make olddefconfig
           cd ..
 
-      - name: 6. Compilar kernel y módulos (con logs detallados)
+      - name: 6. Compilar kernel y módulos
         run: |
           cd linux-src
           export KBUILD_BUILD_TIMESTAMP=$(date -u -d @0 +"%Y-%m-%d %H:%M:%S")
           export KBUILD_BUILD_USER=voidlinux
           export KBUILD_BUILD_HOST=voidlinux
           export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-          
+
           make -j$(nproc) prepare
           make -j$(nproc) bzImage modules V=1 2>&1 | tee ../build.log
           cd ..
@@ -89,7 +100,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-test
           path: build.log
 
       - name: 8. Instalar kernel, módulos y compilar headers
@@ -98,32 +109,32 @@ jobs:
           cd linux-src
           KERNEL_RELEASE=$(make kernelrelease)
           echo "KERNEL_RELEASE=${KERNEL_RELEASE}" >> $GITHUB_ENV
-          
+
           make INSTALL_MOD_PATH=$GITHUB_WORKSPACE/modules modules_install
-          
+
           mkdir -p $GITHUB_WORKSPACE/pkg/boot
           cp arch/x86/boot/bzImage $GITHUB_WORKSPACE/pkg/boot/vmlinuz-${KERNEL_RELEASE}
           cp System.map $GITHUB_WORKSPACE/pkg/boot/System.map-${KERNEL_RELEASE}
           cp .config $GITHUB_WORKSPACE/pkg/boot/config-${KERNEL_RELEASE}
-          
+
           mkdir -p $GITHUB_WORKSPACE/pkg/lib/modules
           mv $GITHUB_WORKSPACE/modules/lib/modules/${KERNEL_RELEASE} $GITHUB_WORKSPACE/pkg/lib/modules/
-          
+
           HEADERS_DIR=$GITHUB_WORKSPACE/pkg/usr/src/linux-headers-${KERNEL_RELEASE}
           mkdir -p $HEADERS_DIR/arch/x86
-          
+
           cp Makefile .config Module.symvers System.map $HEADERS_DIR/
           cp -a scripts include $HEADERS_DIR/
           cp -a arch/x86/include $HEADERS_DIR/arch/x86/
           cp arch/x86/Makefile $HEADERS_DIR/arch/x86/ || true
-          
+
           if [ -f tools/objtool/objtool ]; then
             mkdir -p $HEADERS_DIR/tools/objtool
             cp tools/objtool/objtool $HEADERS_DIR/tools/objtool/
           fi
-          
+
           find $HEADERS_DIR/scripts -type f -name '*.o' -delete
-          
+
           cd $GITHUB_WORKSPACE/pkg/lib/modules/${KERNEL_RELEASE}
           rm -f build source
           ln -sf /usr/src/linux-headers-${KERNEL_RELEASE} build
@@ -134,11 +145,13 @@ jobs:
         if: success()
         run: |
           cd $GITHUB_WORKSPACE/pkg
-          tar -czf ../zen-kernel-void-${KERNEL_RELEASE}.tar.gz .
+          tar -czf ../linux-zen-test-${KERNEL_VER}.tar.gz .
           cd ..
-      - name: Subir a Release 
+
+      - name: "10. Subir a Release (tag: zen-test)"
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: 7.1
+          tag_name: zen-test
           files: |
-            zen-kernel-void-*.tar.gz
+            linux-zen-test-*.tar.gz
