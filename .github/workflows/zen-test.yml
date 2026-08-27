@@ -19,6 +19,9 @@ env:
 jobs:
   build-kernel-test:
     runs-on: ubuntu-latest
+    # Needed so the GITHUB_TOKEN can create the 'zen-test' release and upload the tarball.
+    permissions:
+      contents: write
     container:
       image: ghcr.io/void-linux/void-glibc-full:latest
       options: --user root
